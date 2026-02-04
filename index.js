@@ -29,6 +29,7 @@ const {
   DISCORD_GUILD_ID,
   DISCORD_BOT_TOKEN,
   FRONTEND_ORIGIN,
+  FRONTEND_REDIRECT,
   SESSION_SECRET,
   PORT = 8787,
 } = process.env;
@@ -44,7 +45,7 @@ if (isProd) {
   app.set('trust proxy', 1);
 }
 
-const allowedOrigins = (FRONTEND_ORIGIN
+const frontendOrigins = (FRONTEND_ORIGIN
   ? FRONTEND_ORIGIN.split(',').map(origin => origin.trim()).filter(Boolean)
   : [
       'http://localhost:5173',
@@ -53,10 +54,14 @@ const allowedOrigins = (FRONTEND_ORIGIN
       'http://127.0.0.1:5174',
     ]);
 
+const frontendRedirect = (FRONTEND_REDIRECT
+  ? FRONTEND_REDIRECT.trim()
+  : (frontendOrigins[0] || 'http://localhost:5173'));
+
 app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (frontendOrigins.includes(origin)) return callback(null, true);
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -168,8 +173,7 @@ app.get('/auth/discord/callback', async (req, res) => {
       updatePlayerDiscord(req.session.walletAddress, req.session.user);
     }
 
-    const redirect = FRONTEND_ORIGIN || 'http://localhost:5173';
-    res.redirect(`${redirect}/?discord=connected`);
+    res.redirect(`${frontendRedirect}/?discord=connected`);
   } catch (error) {
     console.error('Discord OAuth failed', error);
     res.status(500).send('Discord OAuth failed.');

@@ -23,6 +23,7 @@ Required for production:
 - `PORT=8787`
 - `DATABASE_PATH=/data/degenerette.sqlite`
 - `FRONTEND_ORIGIN=https://degener.us,https://www.degener.us`
+- `FRONTEND_REDIRECT=https://degener.us`
 - `SESSION_SECRET=...`
 
 Discord (required for connect + auto-join):
@@ -48,6 +49,7 @@ fly secrets set \
   PORT=8787 \
   DATABASE_PATH=/data/degenerette.sqlite \
   FRONTEND_ORIGIN=https://degener.us,https://www.degener.us \
+  FRONTEND_REDIRECT=https://degener.us \
   SESSION_SECRET=CHANGE_ME \
   DISCORD_CLIENT_ID=... \
   DISCORD_CLIENT_SECRET=... \
