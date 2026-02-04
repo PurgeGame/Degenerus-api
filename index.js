@@ -165,7 +165,7 @@ app.get('/auth/discord/callback', async (req, res) => {
 
     req.session.user = {
       id: user.id,
-      username: `${user.username}${user.discriminator ? `#${user.discriminator}` : ''}`,
+      username: (user.global_name || user.username || '').toString(),
       avatarUrl,
     };
 
