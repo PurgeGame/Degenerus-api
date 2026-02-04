@@ -22,6 +22,7 @@ Required for production:
 - `NODE_ENV=production`
 - `PORT=8787`
 - `DATABASE_PATH=/data/degenerette.sqlite`
+- `SESSION_DB_PATH=/data/degenerette.sqlite`
 - `FRONTEND_ORIGIN=https://degener.us,https://www.degener.us`
 - `FRONTEND_REDIRECT=https://degener.us`
 - `SESSION_SECRET=...`

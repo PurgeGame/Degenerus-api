@@ -1,8 +1,11 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import express from 'express';
 import session from 'express-session';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import Database from 'better-sqlite3';
 import { isAddress, verifyMessage } from 'ethers';
 import {
   getOrCreatePlayer,
@@ -31,6 +34,7 @@ const {
   FRONTEND_ORIGIN,
   FRONTEND_REDIRECT,
   SESSION_SECRET,
+  SESSION_DB_PATH,
   PORT = 8787,
 } = process.env;
 
@@ -69,15 +73,109 @@ app.use(cors({
 
 app.use(express.json());
 
+class SQLiteSessionStore extends session.Store {
+  constructor(db) {
+    super();
+    this.db = db;
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        sid TEXT PRIMARY KEY,
+        sess TEXT NOT NULL,
+        expires INTEGER
+      );
+    `);
+    this.getStmt = this.db.prepare('SELECT sess FROM sessions WHERE sid = ? AND (expires IS NULL OR expires > ?)');
+    this.setStmt = this.db.prepare(`
+      INSERT INTO sessions (sid, sess, expires)
+      VALUES (?, ?, ?)
+      ON CONFLICT(sid) DO UPDATE SET sess = excluded.sess, expires = excluded.expires
+    `);
+    this.destroyStmt = this.db.prepare('DELETE FROM sessions WHERE sid = ?');
+    this.touchStmt = this.db.prepare('UPDATE sessions SET expires = ? WHERE sid = ?');
+    this.cleanupStmt = this.db.prepare('DELETE FROM sessions WHERE expires IS NOT NULL AND expires <= ?');
+    this.lastCleanup = 0;
+  }
+
+  _expires(sessionData) {
+    if (sessionData?.cookie?.expires) {
+      return new Date(sessionData.cookie.expires).getTime();
+    }
+    if (typeof sessionData?.cookie?.maxAge === 'number') {
+      return Date.now() + sessionData.cookie.maxAge;
+    }
+    return null;
+  }
+
+  _cleanup() {
+    const now = Date.now();
+    if (now - this.lastCleanup < 60 * 60 * 1000) return;
+    this.lastCleanup = now;
+    try {
+      this.cleanupStmt.run(now);
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+
+  get(sid, cb) {
+    try {
+      const row = this.getStmt.get(sid, Date.now());
+      if (!row) return cb(null, null);
+      return cb(null, JSON.parse(row.sess));
+    } catch (err) {
+      return cb(err);
+    }
+  }
+
+  set(sid, sessionData, cb) {
+    try {
+      const expires = this._expires(sessionData);
+      this.setStmt.run(sid, JSON.stringify(sessionData), expires);
+      this._cleanup();
+      return cb(null);
+    } catch (err) {
+      return cb(err);
+    }
+  }
+
+  destroy(sid, cb) {
+    try {
+      this.destroyStmt.run(sid);
+      return cb(null);
+    } catch (err) {
+      return cb(err);
+    }
+  }
+
+  touch(sid, sessionData, cb) {
+    try {
+      const expires = this._expires(sessionData);
+      this.touchStmt.run(expires, sid);
+      return cb(null);
+    } catch (err) {
+      return cb(err);
+    }
+  }
+}
+
+const sessionDbPath = SESSION_DB_PATH || process.env.DATABASE_PATH || path.join(process.cwd(), 'data', 'degenerette.sqlite');
+fs.mkdirSync(path.dirname(sessionDbPath), { recursive: true });
+const sessionDb = new Database(sessionDbPath);
+sessionDb.pragma('journal_mode = WAL');
+const sessionStore = new SQLiteSessionStore(sessionDb);
+
 app.use(session({
   name: 'discord.sid',
   secret: SESSION_SECRET || 'dev-session-secret',
+  store: sessionStore,
   resave: false,
   saveUninitialized: false,
+  rolling: true,
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
     secure: isProd,
+    maxAge: 1000 * 60 * 60 * 24 * 30,
   },
 }));
 
