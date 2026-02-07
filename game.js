@@ -5,16 +5,14 @@ const TOTAL_WEIGHT = 75;
 const FULL_TICKET_PAYOUTS_BPS = [
   0,
   0,
-  189,
-  500,
-  1778,
-  6667,
-  31100,
-  155600,
-  355600,
+  190,
+  475,
+  1500,
+  4250,
+  19500,
+  100000,
+  10000000,
 ];
-const JACKPOT_MULTIPLIER_BPS = 10000000;
-const SPECIAL_MATCH_MIN_MULTIPLIER_BPS = 400;
 const CURRENCY_WWXRP = 3;
 const CURRENCY_NAMES = ['ETH', 'BURNIE', 'DGNRS', 'WWXRP'];
 
@@ -34,12 +32,10 @@ const ETH_ROI_BONUS_BPS = 500;
 const WWXRP_HIGH_ROI_MIN = 9000;
 const WWXRP_HIGH_ROI_MAX = 10990;
 const WWXRP_BONUS_FACTOR_SCALE = 1000000;
-const WWXRP_BONUS_FACTOR_BUCKET5 = 144136;
-const WWXRP_BONUS_FACTOR_BUCKET6 = 900848;
-const WWXRP_BONUS_FACTOR_BUCKET7 = 4206141;
-const WWXRP_BONUS_FACTOR_BUCKET8 = 97914359;
-const WWXRP_BONUS_FACTOR_BUCKET9 = 344701627;
-const FULL_TICKET_NON_WWXRP_SCALE = 0.871470;
+const WWXRP_BONUS_FACTOR_BUCKET5 = 1531388;
+const WWXRP_BONUS_FACTOR_BUCKET6 = 13016797;
+const WWXRP_BONUS_FACTOR_BUCKET7 = 57745766;
+const WWXRP_BONUS_FACTOR_BUCKET8 = 30027799;
 
 function randomInt(max) {
   return crypto.randomInt(max);
@@ -59,7 +55,7 @@ function randomWeightedBucket() {
   return weightedBucket(randomInt(TOTAL_WEIGHT));
 }
 
-export function generateRandomTicket(forPlayer = true) {
+export function generateRandomTicket() {
   const traits = [
     { quadrant: 0, color: randomWeightedBucket(), symbol: randomWeightedBucket() },
     { quadrant: 1, color: randomWeightedBucket(), symbol: randomWeightedBucket() },
@@ -67,18 +63,7 @@ export function generateRandomTicket(forPlayer = true) {
     { quadrant: 3, color: randomWeightedBucket(), symbol: randomWeightedBucket() },
   ];
 
-  let special = 0;
-  if (forPlayer) {
-    special = 1 + randomInt(3);
-  } else {
-    const roll = randomInt(100);
-    if (roll === 0) special = 1;
-    else if (roll === 1) special = 2;
-    else if (roll === 2) special = 3;
-    else special = 0;
-  }
-
-  return { traits, special };
+  return { traits };
 }
 
 function countMatches(playerTicket, resultTicket) {
@@ -88,10 +73,6 @@ function countMatches(playerTicket, resultTicket) {
     if (playerTicket.traits[q].symbol === resultTicket.traits[q].symbol) matches += 1;
   }
   return matches;
-}
-
-function specialsMatch(playerSpecial, resultSpecial) {
-  return playerSpecial !== 0 && playerSpecial === resultSpecial;
 }
 
 function calculateRoi(activityScore, currency) {
@@ -122,10 +103,9 @@ function calculateWwxrpHighRoi(activityScore) {
   return WWXRP_HIGH_ROI_MIN + Math.floor((WWXRP_HIGH_ROI_MAX - WWXRP_HIGH_ROI_MIN) * progress);
 }
 
-function bonusBucket(matches, specialMatch) {
+function bonusBucket(matches) {
   if (matches < 5) return 0;
-  if (matches === 8) return specialMatch ? 9 : 8;
-  return matches;
+  return matches; // 5,6,7,8
 }
 
 function bonusRoiForBucket(bucket, bonusRoiBps) {
@@ -134,21 +114,40 @@ function bonusRoiForBucket(bucket, bonusRoiBps) {
   else if (bucket === 6) factor = WWXRP_BONUS_FACTOR_BUCKET6;
   else if (bucket === 7) factor = WWXRP_BONUS_FACTOR_BUCKET7;
   else if (bucket === 8) factor = WWXRP_BONUS_FACTOR_BUCKET8;
-  else if (bucket === 9) factor = WWXRP_BONUS_FACTOR_BUCKET9;
   if (!factor) return 0;
   return Math.floor((bonusRoiBps * factor) / WWXRP_BONUS_FACTOR_SCALE);
 }
 
-function calculateEvNormalization(playerTicket) {
-  let totalWeightProduct = 1;
-  const uniformWeightProduct = Math.pow(10 / TOTAL_WEIGHT, 8);
+// Per-outcome EV normalization using product-of-ratios
+function calculateEvNormalization(playerTicket, resultTicket) {
+  let num = 1;
+  let den = 1;
 
-  for (const trait of playerTicket.traits) {
-    totalWeightProduct *= BUCKET_WEIGHTS[trait.color] / TOTAL_WEIGHT;
-    totalWeightProduct *= BUCKET_WEIGHTS[trait.symbol] / TOTAL_WEIGHT;
+  for (let q = 0; q < 4; q += 1) {
+    const pColor = playerTicket.traits[q].color;
+    const pSymbol = playerTicket.traits[q].symbol;
+    const rColor = resultTicket.traits[q].color;
+    const rSymbol = resultTicket.traits[q].symbol;
+
+    const wC = BUCKET_WEIGHTS[pColor];
+    const wS = BUCKET_WEIGHTS[pSymbol];
+
+    const colorMatch = pColor === rColor;
+    const symbolMatch = pSymbol === rSymbol;
+
+    if (colorMatch && symbolMatch) {
+      num *= 100;
+      den *= wC * wS;
+    } else if (colorMatch || symbolMatch) {
+      num *= 1300;
+      den *= 75 * (wC + wS) - 2 * wC * wS;
+    } else {
+      num *= 4225;
+      den *= (TOTAL_WEIGHT - wC) * (TOTAL_WEIGHT - wS);
+    }
   }
 
-  return uniformWeightProduct / totalWeightProduct;
+  return num / den;
 }
 
 function formatCurrencyAmount(amount, currency, noDecimals = false) {
@@ -182,9 +181,6 @@ export function spinFullTicket({ player, ticket, amount, currency }) {
   const balance = Number(player.balance_wwxrp);
   if (balance < amount) return null;
 
-  const playerSpecial = Number(ticket.special);
-  if (playerSpecial < 1 || playerSpecial > 3) return null;
-
   const activityScore = Math.min(Number(player.activity_score_bps) + 100, ROI_THRESHOLDS.MAX_SCORE);
   const roiBps = calculateRoi(activityScore, currency);
   const highRoi = currency === CURRENCY_WWXRP ? calculateWwxrpHighRoi(activityScore) : 0;
@@ -195,41 +191,26 @@ export function spinFullTicket({ player, ticket, amount, currency }) {
       color: Number(trait.color),
       symbol: Number(trait.symbol),
     })),
-    special: playerSpecial,
   };
-  const resultTicket = generateRandomTicket(false);
+  const resultTicket = generateRandomTicket();
 
   const matches = countMatches(playerTicket, resultTicket);
-  const hasSpecialMatch = specialsMatch(playerTicket.special, resultTicket.special);
 
-  let payoutMultiplierBps;
-  let isJackpot = false;
-  if (matches === 8 && hasSpecialMatch) {
-    payoutMultiplierBps = JACKPOT_MULTIPLIER_BPS;
-    isJackpot = true;
-  } else if (hasSpecialMatch) {
-    const baseTier = Math.min(matches + 1, 8);
-    payoutMultiplierBps = Math.max(
-      FULL_TICKET_PAYOUTS_BPS[baseTier],
-      SPECIAL_MATCH_MIN_MULTIPLIER_BPS
-    );
-  } else {
-    payoutMultiplierBps = FULL_TICKET_PAYOUTS_BPS[matches];
-  }
+  const payoutMultiplierBps = FULL_TICKET_PAYOUTS_BPS[matches];
+  const isJackpot = matches === 8;
 
   let effectiveRoi = roiBps;
-  const bucket = bonusBucket(matches, hasSpecialMatch);
+  const bucket = bonusBucket(matches);
   if (currency === CURRENCY_WWXRP && highRoi > roiBps && bucket !== 0) {
     const bonusRoi = highRoi - roiBps;
     effectiveRoi = roiBps + bonusRoiForBucket(bucket, bonusRoi);
   } else if (currency === 0 && bucket !== 0) {
     effectiveRoi = roiBps + bonusRoiForBucket(bucket, ETH_ROI_BONUS_BPS);
   }
-  const evNorm = calculateEvNormalization(playerTicket);
-  let payout = (amount * payoutMultiplierBps * effectiveRoi) / (100 * 10000) * evNorm;
-  if (currency !== CURRENCY_WWXRP) {
-    payout *= FULL_TICKET_NON_WWXRP_SCALE;
-  }
+
+  const evNorm = calculateEvNormalization(playerTicket, resultTicket);
+  let payout = (amount * payoutMultiplierBps * effectiveRoi) / 1_000_000 * evNorm;
+
   const totalBet = amount;
   const totalPayout = payout;
   const netResult = totalPayout - totalBet;
@@ -237,9 +218,7 @@ export function spinFullTicket({ player, ticket, amount, currency }) {
   const matchMultiplier = payoutMultiplierBps / 100;
   const activityMultiplier = effectiveRoi / 10000;
   const isLoss = payout <= 0;
-  const matchLabel = hasSpecialMatch
-    ? 'Special'
-    : `${matches} ${matches === 1 ? 'match' : 'matches'}`;
+  const matchLabel = `${matches} ${matches === 1 ? 'match' : 'matches'}`;
   const noDecimals = Math.abs(payout) >= 100;
   const factors = [
     [formatCurrencyAmount(amount, currency, noDecimals), 'Bet'],
@@ -258,7 +237,6 @@ export function spinFullTicket({ player, ticket, amount, currency }) {
     mode: 1,
     results: [{
       matches,
-      specialMatch: hasSpecialMatch,
       payoutMultiplierBps,
       payout,
       playerTicket,
