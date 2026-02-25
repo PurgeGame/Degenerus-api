@@ -13,13 +13,14 @@ import {
   updatePlayerDiscord,
   setPlayerNonce,
   clearPlayerNonce,
-  updatePlayerState,
-  recordSpin,
+  atomicSpin,
   sanitizePlayer,
   setReferrerCode,
   ensureReferralCode,
   setAffiliateConfig,
   getLeaderboard,
+  getBiggestWins,
+  registerAgent,
 } from './storage.js';
 import { spinFullTicket } from './game.js';
 
@@ -179,6 +180,35 @@ app.use(session({
   },
 }));
 
+// Simple in-memory rate limiter per session. Returns middleware.
+// maxRequests within windowMs per session. Keyed on session ID.
+function rateLimit(maxRequests, windowMs) {
+  const hits = new Map();
+  // Periodic cleanup so the map doesn't grow unbounded
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of hits) {
+      if (now - entry.windowStart > windowMs * 2) hits.delete(key);
+    }
+  }, windowMs * 5).unref();
+
+  return (req, res, next) => {
+    const key = req.sessionID || req.ip;
+    const now = Date.now();
+    let entry = hits.get(key);
+    if (!entry || now - entry.windowStart > windowMs) {
+      entry = { windowStart: now, count: 0 };
+      hits.set(key, entry);
+    }
+    entry.count += 1;
+    if (entry.count > maxRequests) {
+      res.status(429).json({ error: 'Too many requests, slow down' });
+      return;
+    }
+    next();
+  };
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
@@ -320,12 +350,10 @@ function isValidTrait(trait) {
 
 function isValidTicket(ticket) {
   if (!ticket || !Array.isArray(ticket.traits) || ticket.traits.length !== 4) return false;
-  if (typeof ticket.special !== 'number') return false;
-  if (ticket.special < 1 || ticket.special > 3) return false;
   return ticket.traits.every(isValidTrait);
 }
 
-app.post('/api/wallet/nonce', (req, res) => {
+app.post('/api/wallet/nonce', rateLimit(5, 10000), (req, res) => {
   const address = req.body?.address?.toString().toLowerCase();
   if (!address || !isAddress(address)) {
     res.status(400).json({ error: 'Invalid address' });
@@ -404,13 +432,16 @@ app.get('/api/leaderboard', (_req, res) => {
   res.json({ leaderboard });
 });
 
-app.post('/api/spin', walletRequired, (req, res) => {
-  const player = getPlayerByAddress(req.session.walletAddress);
-  if (!player) {
-    res.status(404).json({ error: 'Player not found' });
-    return;
-  }
+app.get('/api/biggest-wins', (_req, res) => {
+  const limitParam = Number(_req.query?.limit ?? 5);
+  const limit = Number.isFinite(limitParam) ? Math.min(Math.max(limitParam, 1), 5) : 5;
+  const wins = getBiggestWins(limit);
+  res.json({ wins });
+});
 
+const MIN_BET_WWXRP = 1;
+
+app.post('/api/spin', walletRequired, rateLimit(10, 5000), (req, res) => {
   const ticket = req.body?.ticket;
   const amount = Number(req.body?.amount);
   const currency = Number(req.body?.currency ?? 3);
@@ -419,8 +450,8 @@ app.post('/api/spin', walletRequired, (req, res) => {
     res.status(400).json({ error: 'Invalid ticket' });
     return;
   }
-  if (!Number.isFinite(amount) || amount <= 0) {
-    res.status(400).json({ error: 'Invalid amount' });
+  if (!Number.isFinite(amount) || amount < MIN_BET_WWXRP || !Number.isInteger(amount)) {
+    res.status(400).json({ error: `Minimum bet is ${MIN_BET_WWXRP} (whole numbers only)` });
     return;
   }
   if (currency !== 3) {
@@ -428,27 +459,17 @@ app.post('/api/spin', walletRequired, (req, res) => {
     return;
   }
 
-  const result = spinFullTicket({
-    player,
-    ticket,
-    amount,
-    currency,
-  });
+  const result = atomicSpin(req.session.walletAddress, (player) =>
+    spinFullTicket({ player, ticket, amount, currency })
+  );
 
-  if (!result) {
-    res.status(400).json({ error: 'Insufficient balance' });
+  if (result.error) {
+    res.status(400).json({ error: result.error });
     return;
   }
 
-  const updated = updatePlayerState(player.eth_address, {
-    balance: result.player.balance_wwxrp,
-    activityScoreBps: result.player.activity_score_bps,
-  });
-
-  recordSpin(updated.id, result.spin);
-
   res.json({
-    player: sanitizePlayer(updated),
+    player: sanitizePlayer(result.player),
     result: result.spin,
   });
 });
@@ -476,6 +497,73 @@ app.post('/api/affiliate/config', walletRequired, discordRequired, (req, res) =>
     return;
   }
   res.json({ player: sanitizePlayer(result.player) });
+});
+
+// --- Agent pre-launch registration (no session required, signature is auth) ---
+
+app.post('/api/agent/register', rateLimit(5, 60000), (req, res) => {
+  const { address, code, rakebackPct, pledgeEth, message, signature, referrer, timestamp } = req.body || {};
+
+  // Validate fields
+  if (!address || typeof address !== 'string' || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid address.' });
+  }
+  const normalizedCode = (code || '').toString().trim().toUpperCase();
+  if (!/^[A-Z0-9]{3,12}$/.test(normalizedCode)) {
+    return res.status(400).json({ error: 'Code must be 3-12 alphanumeric characters.' });
+  }
+  const rbPct = Number(rakebackPct) || 0;
+  if (!Number.isInteger(rbPct) || rbPct < 0 || rbPct > 25) {
+    return res.status(400).json({ error: 'Rakeback must be 0-25.' });
+  }
+  const pledge = Number(pledgeEth) || 0;
+  if (pledge < 0) {
+    return res.status(400).json({ error: 'Pledge cannot be negative.' });
+  }
+  if (!message || !signature || !timestamp) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  const lowerAddr = address.toLowerCase();
+
+  // Verify signature
+  let recovered;
+  try {
+    recovered = verifyMessage(message, signature);
+  } catch {
+    return res.status(401).json({ error: 'Invalid signature.' });
+  }
+  if (recovered.toLowerCase() !== lowerAddr) {
+    return res.status(401).json({ error: 'Signature does not match address.' });
+  }
+
+  // Verify message contains committed data
+  if (!message.includes('"' + normalizedCode + '"')) {
+    return res.status(400).json({ error: 'Code mismatch in signed message.' });
+  }
+  if (!message.includes(rbPct + '% rakeback')) {
+    return res.status(400).json({ error: 'Rakeback mismatch in signed message.' });
+  }
+  if (!message.toLowerCase().includes(lowerAddr)) {
+    return res.status(400).json({ error: 'Address mismatch in signed message.' });
+  }
+
+  const result = registerAgent({
+    address: lowerAddr,
+    code: normalizedCode,
+    rakebackPct: rbPct,
+    pledgeEth: pledge,
+    message,
+    signature,
+    referrer: referrer?.toString().trim() || null,
+    timestamp,
+  });
+
+  if (result.error) {
+    return res.status(409).json({ error: result.error });
+  }
+
+  res.json({ ok: true, code: result.code, bumped: result.bumped });
 });
 
 app.listen(PORT, () => {

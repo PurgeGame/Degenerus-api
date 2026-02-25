@@ -150,16 +150,26 @@ function calculateEvNormalization(playerTicket, resultTicket) {
   return num / den;
 }
 
-function formatCurrencyAmount(amount, currency, noDecimals = false) {
-  const name = CURRENCY_NAMES[currency] ?? '';
-  const decimals = noDecimals ? 0 : 2;
-  return `${amount.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })} ${name}`.trim();
+function formatNumberWithOptionalDecimals(value, decimals = 2) {
+  if (!Number.isFinite(value)) return 'n/a';
+  const rounded = Number(value.toFixed(decimals));
+  const useDecimals = !Number.isInteger(rounded);
+  const places = useDecimals ? decimals : 0;
+  return rounded.toLocaleString(undefined, { minimumFractionDigits: places, maximumFractionDigits: places });
 }
 
-function formatMultiplier(value, noDecimals = false) {
+function formatCurrencyAmount(amount, currency) {
+  const name = currency === CURRENCY_WWXRP ? '' : (CURRENCY_NAMES[currency] ?? '');
+  const value = formatNumberWithOptionalDecimals(amount, 2);
+  return name ? `${value} ${name}` : value;
+}
+
+function formatMultiplier(value) {
   if (!Number.isFinite(value)) return 'n/a';
-  const decimals = noDecimals ? 0 : 2;
-  return `x${value.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
+  // Show 2 decimal places, but omit if .00
+  const fixed = value.toFixed(2);
+  const display = fixed.endsWith('.00') ? Math.round(value).toString() : fixed;
+  return `x${display}`;
 }
 
 function formatActivityScore(scoreBps) {
@@ -219,16 +229,15 @@ export function spinFullTicket({ player, ticket, amount, currency }) {
   const activityMultiplier = effectiveRoi / 10000;
   const isLoss = payout <= 0;
   const matchLabel = `${matches} ${matches === 1 ? 'match' : 'matches'}`;
-  const noDecimals = Math.abs(payout) >= 100;
   const factors = [
-    [formatCurrencyAmount(amount, currency, noDecimals), 'Bet'],
-    [formatMultiplier(matchMultiplier, noDecimals), matchLabel],
+    [formatCurrencyAmount(amount, currency), 'Bet'],
+    [formatMultiplier(matchMultiplier), matchLabel],
   ];
   if (!isLoss) {
     factors.push(
-      [formatMultiplier(activityMultiplier, noDecimals), 'Activity score'],
-      [formatMultiplier(evNorm, noDecimals), 'Difficulty'],
-      [formatCurrencyAmount(payout, currency, noDecimals), 'Payout']
+      [formatMultiplier(activityMultiplier), 'Activity score'],
+      [formatMultiplier(evNorm), 'Difficulty'],
+      [formatCurrencyAmount(payout, currency), 'Payout']
     );
   }
   const math = buildMathTable(factors, !isLoss);

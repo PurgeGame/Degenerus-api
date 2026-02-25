@@ -26,6 +26,22 @@ db.exec(`
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  CREATE TABLE IF NOT EXISTS agent_registrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    address TEXT UNIQUE NOT NULL,
+    code TEXT UNIQUE NOT NULL,
+    rakeback_pct INTEGER NOT NULL DEFAULT 0,
+    pledge_eth REAL NOT NULL DEFAULT 0,
+    message TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    referrer TEXT,
+    timestamp TEXT NOT NULL,
+    exported INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_agent_reg_referrer ON agent_registrations(referrer);
+
   CREATE TABLE IF NOT EXISTS spins (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     player_id INTEGER NOT NULL,
@@ -91,11 +107,17 @@ export function getPlayerByReferralCode(code) {
 }
 
 export function getLeaderboard(limit = 10) {
+  // Only show highest balance per Discord user (prevents multi-wallet spam)
   const rows = db.prepare(`
-    SELECT eth_address, discord_name, discord_avatar, balance_wwxrp
-    FROM players
-    WHERE discord_id IS NOT NULL AND discord_id != ''
-    ORDER BY balance_wwxrp DESC, updated_at DESC
+    SELECT p.eth_address, p.discord_id, p.discord_name, p.discord_avatar, p.balance_wwxrp
+    FROM players p
+    INNER JOIN (
+      SELECT discord_id, MAX(balance_wwxrp) as max_balance
+      FROM players
+      WHERE discord_id IS NOT NULL AND discord_id != ''
+      GROUP BY discord_id
+    ) best ON p.discord_id = best.discord_id AND p.balance_wwxrp = best.max_balance
+    ORDER BY p.balance_wwxrp DESC, p.updated_at DESC
     LIMIT ?
   `).all(limit);
   return rows.map((row) => ({
@@ -103,6 +125,30 @@ export function getLeaderboard(limit = 10) {
     discord_name: row.discord_name,
     discord_avatar: row.discord_avatar,
     balance_wwxrp: row.balance_wwxrp,
+  }));
+}
+
+export function getBiggestWins(limit = 10) {
+  const rows = db.prepare(`
+    SELECT s.bet_amount, s.payout, s.net, s.matches, s.player_ticket, s.house_ticket,
+           p.eth_address, p.discord_name, p.discord_avatar
+    FROM spins s
+    INNER JOIN players p ON p.id = s.player_id
+    WHERE s.net > 0
+    ORDER BY (s.payout / s.bet_amount) DESC, s.payout DESC, s.created_at DESC
+    LIMIT ?
+  `).all(limit);
+
+  return rows.map((row) => ({
+    eth_address: row.eth_address,
+    discord_name: row.discord_name,
+    discord_avatar: row.discord_avatar,
+    bet_amount: row.bet_amount,
+    payout: row.payout,
+    net: row.net,
+    matches: row.matches,
+    player_ticket: row.player_ticket,
+    house_ticket: row.house_ticket,
   }));
 }
 
@@ -115,11 +161,12 @@ export function getOrCreatePlayer(address) {
     INSERT INTO players (eth_address, referral_code)
     VALUES (?, ?)
   `);
-  while (true) {
+  for (let attempts = 0; attempts < 20; attempts++) {
     try {
       insert.run(address, referral);
       break;
     } catch (err) {
+      if (attempts === 19) throw new Error('Failed to generate unique referral code');
       referral = generateReferralCode();
     }
   }
@@ -133,7 +180,7 @@ export function ensureReferralCode(address) {
   if (player.referral_code) return player.referral_code;
 
   let referral = generateReferralCode();
-  while (true) {
+  for (let attempts = 0; attempts < 20; attempts++) {
     try {
       db.prepare(`
         UPDATE players
@@ -142,6 +189,7 @@ export function ensureReferralCode(address) {
       `).run(referral, address);
       break;
     } catch (err) {
+      if (attempts === 19) throw new Error('Failed to generate unique referral code');
       referral = generateReferralCode();
     }
   }
@@ -219,6 +267,49 @@ export function updatePlayerState(address, { balance, activityScoreBps }) {
   return getPlayerByAddress(address);
 }
 
+// Atomic spin: read balance, validate, compute result, write — all in one transaction.
+// SQLite serializes transactions so concurrent spins on the same player are sequenced.
+export function atomicSpin(address, spinFn) {
+  const txn = db.transaction(() => {
+    const row = db.prepare('SELECT * FROM players WHERE eth_address = ?').get(address);
+    if (!row) return { error: 'Player not found' };
+    const player = serializePlayer(row);
+
+    const result = spinFn(player);
+    if (!result) return { error: 'Insufficient balance' };
+
+    // Atomic balance update with guard: balance must still be >= bet amount
+    const changed = db.prepare(`
+      UPDATE players
+      SET balance_wwxrp = ?, activity_score_bps = ?, updated_at = datetime('now')
+      WHERE eth_address = ? AND balance_wwxrp >= ?
+    `).run(
+      result.player.balance_wwxrp,
+      result.player.activity_score_bps,
+      address,
+      result.spin.totalBet
+    );
+
+    if (changed.changes === 0) return { error: 'Balance changed, try again' };
+
+    const latest = result.spin.results?.[result.spin.results.length - 1];
+    const matches = latest?.matches ?? 0;
+    const playerTicket = JSON.stringify(latest?.playerTicket ?? {});
+    const houseTicket = JSON.stringify(latest?.resultTicket ?? {});
+    db.prepare(`
+      INSERT INTO spins (player_id, bet_amount, payout, net, matches, player_ticket, house_ticket)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(player.id, result.spin.totalBet, result.spin.totalPayout, result.spin.netResult, matches, playerTicket, houseTicket);
+
+    const updated = serializePlayer(
+      db.prepare('SELECT * FROM players WHERE eth_address = ?').get(address)
+    );
+    return { ok: true, player: updated, spin: result.spin };
+  });
+
+  return txn();
+}
+
 export function setReferrerCode(address, referrerCode) {
   if (!referrerCode) return;
   const normalized = referrerCode.trim().toUpperCase();
@@ -230,6 +321,65 @@ export function setReferrerCode(address, referrerCode) {
     SET referrer_code = ?, updated_at = datetime('now')
     WHERE eth_address = ? AND referrer_code IS NULL
   `).run(normalized, address);
+}
+
+// --- Agent registration ---
+
+const MAX_AGENT_REGISTRATIONS = 400;
+
+const _agentRegCount = db.prepare('SELECT COUNT(*) as cnt FROM agent_registrations');
+const _agentRegInsert = db.prepare(`
+  INSERT INTO agent_registrations (address, code, rakeback_pct, pledge_eth, message, signature, referrer, timestamp)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const _agentRegNewestNoPledge = db.prepare(`
+  SELECT id, code FROM agent_registrations WHERE pledge_eth = 0 ORDER BY created_at DESC LIMIT 1
+`);
+const _agentRegDelete = db.prepare('DELETE FROM agent_registrations WHERE id = ?');
+
+export function registerAgent({ address, code, rakebackPct, pledgeEth, message, signature, referrer, timestamp }) {
+  const count = _agentRegCount.get().cnt;
+  let bumped = null;
+
+  if (count >= MAX_AGENT_REGISTRATIONS) {
+    if (pledgeEth > 0) {
+      const victim = _agentRegNewestNoPledge.get();
+      if (victim) {
+        _agentRegDelete.run(victim.id);
+        bumped = victim.code;
+      } else {
+        return { error: 'Registration is full. All ' + MAX_AGENT_REGISTRATIONS + ' slots are held by pledged registrations.' };
+      }
+    } else {
+      return { error: 'Registration is full (' + MAX_AGENT_REGISTRATIONS + ' slots). Add an ETH pledge to bump a non-pledged registration.' };
+    }
+  }
+
+  try {
+    _agentRegInsert.run(address, code, rakebackPct, pledgeEth, message, signature, referrer || null, timestamp);
+    return { ok: true, code, bumped };
+  } catch (err) {
+    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.message?.includes('UNIQUE constraint failed')) {
+      if (err.message.includes('address')) {
+        return { error: 'This wallet has already registered a code.' };
+      }
+      if (err.message.includes('code')) {
+        return { error: "Code '" + code + "' is already claimed." };
+      }
+      return { error: 'Duplicate registration.' };
+    }
+    throw err;
+  }
+}
+
+export function getAgentRegistrations({ exportedOnly = false } = {}) {
+  const where = exportedOnly ? 'WHERE exported = 0' : '';
+  return db.prepare('SELECT * FROM agent_registrations ' + where + ' ORDER BY created_at ASC').all();
+}
+
+export function markAgentRegistrationsExported(ids) {
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare('UPDATE agent_registrations SET exported = 1 WHERE id IN (' + placeholders + ')').run(...ids);
 }
 
 export function recordSpin(playerId, spin) {
