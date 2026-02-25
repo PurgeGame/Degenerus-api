@@ -21,6 +21,7 @@ import {
   getLeaderboard,
   getBiggestWins,
   registerAgent,
+  getAgentRegistrations,
 } from './storage.js';
 import { spinFullTicket } from './game.js';
 
@@ -564,6 +565,18 @@ app.post('/api/agent/register', rateLimit(5, 60000), (req, res) => {
   }
 
   res.json({ ok: true, code: result.code, bumped: result.bumped });
+});
+
+app.get('/api/agent/registrations', (_req, res) => {
+  const rows = getAgentRegistrations();
+  const registrations = rows.map(r => ({
+    code: r.code,
+    rakebackPct: r.rakeback_pct,
+    pledgeEth: r.pledge_eth,
+    referrer: r.referrer,
+    createdAt: r.created_at,
+  }));
+  res.json({ count: registrations.length, registrations });
 });
 
 app.listen(PORT, () => {
